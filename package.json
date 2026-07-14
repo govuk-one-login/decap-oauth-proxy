@@ -15,7 +15,9 @@
     "lint:fix": "eslint . --fix",
     "format": "prettier --check .",
     "format:fix": "prettier --write .",
-    "build": "esbuild src/handler.ts --bundle --platform=node --target=node24 --outfile=dist/handler.mjs --format=esm --external:@aws-sdk"
+    "build": "esbuild src/handler.ts --bundle --platform=node --target=node24 --outfile=dist/handler.mjs --format=esm --external:@aws-sdk",
+    "dev": "tsx scripts/dev-server.ts",
+    "dev:mock": "tsx scripts/dev-server.ts --mock"
   },
   "dependencies": {
     "@aws-sdk/client-secrets-manager": "3.1086.0",
@@ -24,11 +26,13 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/aws-lambda": "8.10.162",
+    "@types/express": "5.0.6",
     "@types/node": "24.13.3",
     "esbuild": "0.28.1",
     "eslint": "10.7.0",
     "eslint-config-prettier": "10.1.8",
     "eslint-plugin-prettier": "5.5.6",
+    "express": "5.2.1",
     "prettier": "3.9.5",
     "tsx": "4.23.1",
     "typescript": "6.0.3",
