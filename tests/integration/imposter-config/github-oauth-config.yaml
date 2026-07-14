@@ -1,0 +1,34 @@
+plugin: rest
+
+resources:
+  # Mock GitHub's authorize endpoint (redirect)
+  - path: /login/oauth/authorize
+    method: GET
+    response:
+      statusCode: 302
+      headers:
+        Location: "${request.queryParams.redirect_uri}?code=mock-auth-code-12345&state=${request.queryParams.state}"
+
+  # Mock GitHub's token exchange endpoint
+  - path: /login/oauth/access_token
+    method: POST
+    capture:
+      body:
+        jsonPath: $.code
+        store: authCode
+    response:
+      statusCode: 200
+      headers:
+        Content-Type: application/json
+      template: true
+      content: |
+        {
+          #if( $stores.authCode == "expired-code" )
+            "error": "bad_verification_code",
+            "error_description": "The code passed is incorrect or expired."
+          #else
+            "access_token": "gho_mock_token_${stores.authCode}",
+            "token_type": "bearer",
+            "scope": "repo,user"
+          #end
+        }
