@@ -1,0 +1,414 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Decap CMS OAuth proxy. Handles GitHub OAuth token exchange for client-side
+  CMS editors. Reusable across multiple docs-as-code sites.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - production
+      - staging
+
+  DomainName:
+    Type: String
+    Description: Custom domain for the OAuth proxy (e.g. cms-auth.example.com)
+
+  HostedZoneId:
+    Type: String
+    Description: Route53 Hosted Zone ID for the custom domain
+
+  AllowedOrigins:
+    Type: String
+    Description: >
+      Comma-separated list of origins allowed to use this proxy
+      (e.g. https://docs-site-a.example.com,https://docs-site-b.example.com)
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment package
+
+  LambdaCodeKey:
+    Type: String
+    Description: S3 key for the Lambda deployment package zip
+
+  OAuthScopes:
+    Type: String
+    Default: "repo,user"
+    Description: >
+      OAuth scopes to request from GitHub. Use "repo,user" for private repos
+      or "public_repo,user" for public repos only.
+
+  PermissionsBoundary:
+    Type: String
+    Default: "none"
+    Description: ARN of the permissions boundary to apply to IAM roles
+
+  SigningProfileVersionArn:
+    Type: String
+    Default: "none"
+    Description: ARN of the AWS Signer signing profile version (from build account)
+
+Conditions:
+  UsePermissionsBoundary:
+    Fn::Not:
+      - Fn::Equals:
+          - !Ref PermissionsBoundary
+          - "none"
+
+  UseCodeSigning:
+    Fn::Not:
+      - Fn::Equals:
+          - !Ref SigningProfileVersionArn
+          - "none"
+
+Resources:
+
+  # ============================================================
+  # Secrets & Configuration
+  # ============================================================
+
+  GitHubClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "/decap-oauth/${Environment}/github-client-secret"
+      Description: GitHub OAuth App client secret for DecapCMS proxy
+      Tags:
+        - Key: Service
+          Value: decap-oauth-proxy
+        - Key: Source
+          Value: govuk-one-login/decap-oauth-proxy/template.yaml
+
+  GitHubClientIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/decap-oauth/${Environment}/github-client-id"
+      Type: String
+      Value: "PLACEHOLDER-UPDATE-AFTER-GITHUB-OAUTH-APP-REGISTRATION"
+      Description: GitHub OAuth App client ID
+      Tags:
+        Service: decap-oauth-proxy
+
+  # ============================================================
+  # API Gateway (HTTP API)
+  # ============================================================
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "decap-oauth-proxy-${Environment}"
+      ProtocolType: HTTP
+      Description: OAuth proxy API for DecapCMS GitHub authentication
+      CorsConfiguration:
+        AllowOrigins: !Split [",", !Ref AllowedOrigins]
+        AllowMethods:
+          - GET
+        AllowHeaders:
+          - Content-Type
+      Tags:
+        Service: decap-oauth-proxy
+        Source: govuk-one-login/decap-oauth-proxy/template.yaml
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: "$default"
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "routeKey":"$context.routeKey","status":"$context.status",
+          "protocol":"$context.protocol","responseLength":"$context.responseLength",
+          "error":"$context.error.message"}
+      Tags:
+        Service: decap-oauth-proxy
+
+  # --- /auth route ---
+
+  AuthIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AuthFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  AuthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /auth"
+      Target: !Sub "integrations/${AuthIntegration}"
+
+  # --- /callback route ---
+
+  CallbackIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CallbackFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  CallbackRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /callback"
+      Target: !Sub "integrations/${CallbackIntegration}"
+
+  # --- Custom domain ---
+
+  ApiDomainName:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - EndpointType: REGIONAL
+          CertificateArn: !Ref Certificate
+
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Properties:
+      ApiId: !Ref HttpApi
+      DomainName: !Ref ApiDomainName
+      Stage: !Ref HttpApiStage
+
+  DnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !Ref DomainName
+      Type: A
+      HostedZoneId: !Ref HostedZoneId
+      AliasTarget:
+        DNSName: !GetAtt ApiDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomainName.RegionalHostedZoneId
+
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+      ValidationMethod: DNS
+
+  # ============================================================
+  # Lambda Functions
+  # ============================================================
+
+  AuthFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "decap-oauth-auth-${Environment}"
+      Runtime: nodejs24.x
+      Handler: handler.auth
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt AuthFunctionRole.Arn
+      Environment:
+        Variables:
+          GITHUB_CLIENT_ID_PARAM: !Sub "/decap-oauth/${Environment}/github-client-id"
+          GITHUB_CLIENT_SECRET_ARN: !Ref GitHubClientSecret
+          ALLOWED_ORIGINS: !Ref AllowedOrigins
+          OAUTH_SCOPES: !Ref OAuthScopes
+      Tags:
+        - Key: Service
+          Value: decap-oauth-proxy
+        - Key: Source
+          Value: govuk-one-login/decap-oauth-proxy/template.yaml
+
+  CallbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "decap-oauth-callback-${Environment}"
+      Runtime: nodejs24.x
+      Handler: handler.callback
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Ref LambdaCodeKey
+      MemorySize: 128
+      Timeout: 10
+      Role: !GetAtt CallbackFunctionRole.Arn
+      Environment:
+        Variables:
+          GITHUB_CLIENT_ID_PARAM: !Sub "/decap-oauth/${Environment}/github-client-id"
+          GITHUB_CLIENT_SECRET_ARN: !Ref GitHubClientSecret
+          ALLOWED_ORIGINS: !Ref AllowedOrigins
+          OAUTH_SCOPES: !Ref OAuthScopes
+      Tags:
+        - Key: Service
+          Value: decap-oauth-proxy
+        - Key: Source
+          Value: govuk-one-login/decap-oauth-proxy/template.yaml
+
+  # --- Lambda permissions for API Gateway invocation ---
+
+  AuthFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  CallbackFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CallbackFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  # ============================================================
+  # IAM Roles
+  # ============================================================
+
+  AuthFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "decap-oauth-auth-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadConfig
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/decap-oauth/${Environment}/*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref GitHubClientSecret
+      PermissionsBoundary: !If
+        - UsePermissionsBoundary
+        - !Ref PermissionsBoundary
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Service
+          Value: decap-oauth-proxy
+
+  CallbackFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "decap-oauth-callback-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadConfig
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/decap-oauth/${Environment}/*"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref GitHubClientSecret
+      PermissionsBoundary: !If
+        - UsePermissionsBoundary
+        - !Ref PermissionsBoundary
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Service
+          Value: decap-oauth-proxy
+
+  # ============================================================
+  # Logging
+  # ============================================================
+
+  AuthFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/decap-oauth-auth-${Environment}"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
+
+  CallbackFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/decap-oauth-callback-${Environment}"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/decap-oauth-proxy-${Environment}"
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LogsKmsKey.Arn
+
+  LogsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - "kms:Encrypt*"
+              - "kms:Decrypt*"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:Describe*"
+            Resource: "*"
+            Condition:
+              ArnLike:
+                "kms:EncryptionContext:aws:logs:arn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*"
+      Tags:
+        - Key: Service
+          Value: decap-oauth-proxy
+
+Outputs:
+  ApiUrl:
+    Description: URL of the OAuth proxy (via custom domain)
+    Value: !Sub "https://${DomainName}"
+
+  ApiGatewayUrl:
+    Description: Default API Gateway URL (before custom domain propagates)
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+
+  GitHubClientSecretArn:
+    Description: Populate this secret with the GitHub OAuth App client secret
+    Value: !Ref GitHubClientSecret
+
+  GitHubClientIdParameterName:
+    Description: Update this parameter with the GitHub OAuth App client ID
+    Value: !Sub "/decap-oauth/${Environment}/github-client-id"
