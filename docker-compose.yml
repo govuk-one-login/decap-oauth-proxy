@@ -1,0 +1,12 @@
+services:
+  github-mock:
+    image: outofcoffee/imposter:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./tests/integration/imposter-config:/opt/imposter/config
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/system/status"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
